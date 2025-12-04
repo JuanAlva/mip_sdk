@@ -55,7 +55,7 @@
 #ifdef _WIN32
 static const char* PORT_NAME = "COM1";
 #else  // Unix
-static const char* PORT_NAME = "/dev/ttyACM0";
+static const char* PORT_NAME = "/dev/ttyUSB0";
 #endif // _WIN32
 
 /// @brief  Set the baudrate for the connection (Serial/USB)
@@ -220,7 +220,7 @@ int main(const int argc, const char* argv[])
         &device,
         &sensor_data_handlers[0],
         MIP_SENSOR_DATA_DESC_SET,          // Data descriptor set
-        MIP_DATA_DESC_SENSOR_ACCEL_SCALED, // Data field descriptor set
+        MIP_DATA_DESC_SENSOR_ACCEL_RAW, // Data field descriptor set
         accel_field_callback,              // Callback
         NULL                               // User data
     );
