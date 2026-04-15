@@ -44,6 +44,7 @@ endif()
 set(SCRIPTS
 	scaled_accel.c
 	scaled_gyro.c
+	scaled_accel2.c
 )
 
 foreach(src ${SCRIPTS})

@@ -57,10 +57,10 @@ with open(CSV_OUTPUT_FILE, "w", newline="") as csvfile:
             part_tow = line.split("TOW =")[1].split()[0]
             tow     = float(part_tow)                
             
-            if "Comp Euler" in line:
-                data = "comp"
-            elif "Filter Euler Angles Uncertainty" in line:
-                data = "uncertainty"
+            if "Scaled Accel" in line:
+                data = "Scaled"
+            elif "Linear Accel" in line:
+                data = "Linear"
             elif "Filter Euler Angles" in line:
                 data = "filter"
             else:

@@ -1,0 +1,6 @@
+timestamp;log;tow;data;roll;pitch;yaw;error
+1776265703.9967842;INFO : Initializing the connection.;;;;;;
+1776265703.9968417;INFO : Connecting to the device on port /dev/ttyUSB0 with 115200 baudrate.;;;;;;
+1776265703.9968612;ERROR: Unable to open port (2): No such file or directory;;;;;;
+1776265703.9968698;ERROR: Could not open the connection!;;;;;;
+1776265703.996876;INFO : Press 'Enter' to exit the program.;;;;;;
