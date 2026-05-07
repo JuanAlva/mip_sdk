@@ -59,17 +59,17 @@
 #ifdef _WIN32
 static const char* PORT_NAME = "COM1";
 #else  // Unix
-static const char* PORT_NAME = "/dev/ttyACM0";
+static const char* PORT_NAME = "/dev/ttyUSB0";
 #endif // _WIN32
 
 /// @brief  Set the baudrate for the connection (Serial/USB)
 /// @note For native serial connections this needs to be 115200 due to the device default settings command
 /// Use mip_base_*_comm_speed() to write and save the baudrate on the device
-static const uint32_t BAUDRATE = 115200;
+static const uint32_t BAUDRATE = 460800;
 
 // TODO: Update to the desired streaming rate. Setting low for readability purposes
 /// @brief Streaming rate in Hz
-static const uint16_t SAMPLE_RATE_HZ = 1;
+static const uint16_t SAMPLE_RATE_HZ = 100;
 
 // TODO: Update to change the example run time
 /// @brief Example run time
@@ -451,6 +451,8 @@ static void configure_filter_message_format(mip_interface* _device)
         &filter_base_rate         // Base rate out
     );
 
+    MICROSTRAIN_LOG_INFO("The filter base rate is %d.\n");
+
     if (!mip_cmd_result_is_ack(cmd_result))
     {
         exit_from_command(_device, cmd_result, "Could not get the base rate for filter data!\n");
@@ -491,6 +493,13 @@ static void configure_filter_message_format(mip_interface* _device)
         MIP_FILTER_DATA_DESC_SET,                                   // Data descriptor set
         sizeof(filter_descriptors) / sizeof(filter_descriptors[0]), // Number of descriptors to include
         filter_descriptors                                          // Descriptor array
+    );
+
+    MICROSTRAIN_LOG_INFO(
+        "Oño rate %d by %d to stream data at %dHz.\n",
+        sizeof(filter_descriptors),
+        sizeof(filter_descriptors[0]),
+        filter_descriptors
     );
 
     if (!mip_cmd_result_is_ack(cmd_result))
@@ -990,7 +999,7 @@ static void initialize_device(mip_interface* _device, serial_port* _device_port,
     // Load the default settings on the device
     // Note: This guarantees the device is in a known state
     MICROSTRAIN_LOG_INFO("Loading device default settings.\n");
-    cmd_result = mip_3dm_default_device_settings(_device);
+    /* cmd_result = mip_3dm_default_device_settings(_device);
 
     if (!mip_cmd_result_is_ack(cmd_result))
     {
@@ -1001,7 +1010,7 @@ static void initialize_device(mip_interface* _device, serial_port* _device_port,
         }
 
         exit_from_command(_device, cmd_result, "Could not load device default settings!\n");
-    }
+    } */
 }
 
 ////////////////////////////////////////////////////////////////////////////////
