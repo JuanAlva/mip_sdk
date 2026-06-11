@@ -34,7 +34,9 @@
 #include <mip/mip_interface.h>
 #include <mip/definitions/commands_3dm.h>
 #include <mip/definitions/commands_base.h>
+#include <mip/definitions/data_filter.h>
 #include <mip/definitions/data_sensor.h>
+#include <mip/definitions/data_shared.h>
 
 #include <inttypes.h>
 #include <stdarg.h>
@@ -71,25 +73,26 @@ void sched_yield();
 // NOTE: Setting these globally for example purposes
 
 // TODO: Update to the correct port name and baudrate
-/// @brief  Set the port name for the connection (Serial/USB)
+/// @brief  Set the port name for the connecti
+.0on (Serial/USB)
 #ifdef _WIN32
 static const char* PORT_NAME = "COM1";
 #else  // Unix
-static const char* PORT_NAME = "/dev/ttyACM0";
+static const char* PORT_NAME = "/dev/ttyUSB0";
 #endif // _WIN32
 
 /// @brief  Set the baudrate for the connection (Serial/USB)
 /// @note For native serial connections this needs to be 115200 due to the device default settings command
 /// Use mip_base_*_comm_speed() to write and save the baudrate on the device
-static const uint32_t BAUDRATE = 115200;
+static const uint32_t BAUDRATE = 460800;
 
 // TODO: Update to the desired streaming rate. Setting low for readability purposes
 /// @brief Streaming rate in Hz
-static const uint16_t SAMPLE_RATE_HZ = 1;
+static const uint16_t SAMPLE_RATE_HZ = 100;
 
 // TODO: Update to change the example run time
 /// @brief Example run time
-static const uint32_t RUN_TIME_SECONDS = 30;
+static const uint32_t RUN_TIME_SECONDS = 600;
 
 // TODO: Enable/disable data collection threading
 /// @brief Use this to test the behaviors of threading
@@ -119,6 +122,7 @@ static void initialize_device(mip_interface* _device, serial_port* _device_port,
 
 // Message format configuration
 static void configure_sensor_message_format(mip_interface* _device);
+static void configure_filter_message_format(mip_interface* _device);
 
 // Packet callback handler
 static void packet_callback(void* _user, const mip_packet_view* _packet_view, mip_timestamp _timestamp);
@@ -202,16 +206,30 @@ int main(const int argc, const char* argv[])
     // Configure the message format for sensor data
     configure_sensor_message_format(&device);
 
-    // Sensor data packet callback
-    MICROSTRAIN_LOG_INFO("Registering a sensor data packet callback.\n");
+    // Configure the message format for filter data (quaternion)
+    configure_filter_message_format(&device);
 
-    mip_dispatch_handler packet_handler;
+    // Sensor and filter data packet callbacks
+    MICROSTRAIN_LOG_INFO("Registering sensor and filter data packet callbacks.\n");
 
-    // Register the callback for packets
+    mip_dispatch_handler sensor_packet_handler;
+    mip_dispatch_handler filter_packet_handler;
+
+    // Register the callback for sensor packets
     mip_interface_register_packet_callback(
         &device,
-        &packet_handler,
+        &sensor_packet_handler,
         MIP_SENSOR_DATA_DESC_SET, // Data descriptor set
+        false,                    // Process after field callback
+        &packet_callback,         // Callback
+        NULL                      // User data
+    );
+
+    // Register the callback for filter packets
+    mip_interface_register_packet_callback(
+        &device,
+        &filter_packet_handler,
+        MIP_FILTER_DATA_DESC_SET, // Data descriptor set
         false,                    // Process after field callback
         &packet_callback,         // Callback
         NULL                      // User data
@@ -526,19 +544,19 @@ static void initialize_device(mip_interface* _device, serial_port* _device_port,
 
     // Load the default settings on the device
     // Note: This guarantees the device is in a known state
-    MICROSTRAIN_LOG_INFO("Loading device default settings.\n");
-    cmd_result = mip_3dm_default_device_settings(_device);
+    // MICROSTRAIN_LOG_INFO("Loading device default settings.\n");
+    // cmd_result = mip_3dm_default_device_settings(_device);
 
-    if (!mip_cmd_result_is_ack(cmd_result))
-    {
-        // Note: Default settings will reset the baudrate to 115200 and may cause connection issues
-        if (cmd_result == MIP_STATUS_TIMEDOUT && BAUDRATE != 115200)
-        {
-            MICROSTRAIN_LOG_WARN("On a native serial connections the baudrate needs to be 115200 for this example to run.\n");
-        }
+    // if (!mip_cmd_result_is_ack(cmd_result))
+    // {
+    //     // Note: Default settings will reset the baudrate to 115200 and may cause connection issues
+    //     if (cmd_result == MIP_STATUS_TIMEDOUT && BAUDRATE != 115200)
+    //     {
+    //         MICROSTRAIN_LOG_WARN("On a native serial connections the baudrate needs to be 115200 for this example to run.\n");
+    //     }
 
-        exit_from_command(_device, cmd_result, "Could not load device default settings!\n");
-    }
+    //     exit_from_command(_device, cmd_result, "Could not load device default settings!\n");
+    // }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -594,8 +612,9 @@ static void configure_sensor_message_format(mip_interface* _device)
     );
 
     // Descriptor rate is a pair of data descriptor set and decimation
-    const mip_descriptor_rate sensor_descriptors[1] = {
-        {MIP_DATA_DESC_SENSOR_ACCEL_SCALED, sensor_decimation}
+    const mip_descriptor_rate sensor_descriptors[2] = {
+        {MIP_DATA_DESC_SHARED_REFERENCE_TIME, sensor_decimation}, // Device internal timestamp (ns)
+        {MIP_DATA_DESC_SENSOR_ACCEL_SCALED,   sensor_decimation}
     };
 
     MICROSTRAIN_LOG_INFO("Configuring message format for sensor data.\n");
@@ -609,6 +628,67 @@ static void configure_sensor_message_format(mip_interface* _device)
     if (!mip_cmd_result_is_ack(cmd_result))
     {
         exit_from_command(_device, cmd_result, "Could not configure message format for sensor data!\n");
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief Configures message format for filter data streaming
+///
+/// @details Sets up filter data output with:
+///          - Attitude quaternion (q_w, q_x, q_y, q_z)
+///
+/// @param _device Pointer to the initialized MIP device interface
+///
+static void configure_filter_message_format(mip_interface* _device)
+{
+    MICROSTRAIN_LOG_INFO("Getting the base rate for filter data.\n");
+    uint16_t       filter_base_rate;
+    mip_cmd_result cmd_result = mip_3dm_get_base_rate(
+        _device,
+        MIP_FILTER_DATA_DESC_SET, // Data descriptor set
+        &filter_base_rate         // Base rate out
+    );
+
+    if (!mip_cmd_result_is_ack(cmd_result))
+    {
+        exit_from_command(_device, cmd_result, "Could not get the base rate for filter data!\n");
+    }
+
+    if (SAMPLE_RATE_HZ == 0 || SAMPLE_RATE_HZ > filter_base_rate)
+    {
+        exit_from_command(
+            _device,
+            MIP_NACK_INVALID_PARAM,
+            "Invalid sample rate of %dHz! Supported rates are [1, %d].\n",
+            SAMPLE_RATE_HZ,
+            filter_base_rate
+        );
+    }
+
+    const uint16_t filter_decimation = filter_base_rate / SAMPLE_RATE_HZ;
+    MICROSTRAIN_LOG_INFO(
+        "Decimating filter base rate %d by %d to stream data at %dHz.\n",
+        filter_base_rate,
+        filter_decimation,
+        SAMPLE_RATE_HZ
+    );
+
+    const mip_descriptor_rate filter_descriptors[2] = {
+        {MIP_DATA_DESC_SHARED_REFERENCE_TIME,  filter_decimation}, // Device internal timestamp (ns)
+        {MIP_DATA_DESC_FILTER_ATT_QUATERNION,  filter_decimation}
+    };
+
+    MICROSTRAIN_LOG_INFO("Configuring message format for filter data.\n");
+    cmd_result = mip_3dm_write_message_format(
+        _device,
+        MIP_FILTER_DATA_DESC_SET,                                       // Data descriptor set
+        sizeof(filter_descriptors) / sizeof(filter_descriptors[0]),     // Number of descriptors
+        filter_descriptors                                              // Descriptor array
+    );
+
+    if (!mip_cmd_result_is_ack(cmd_result))
+    {
+        exit_from_command(_device, cmd_result, "Could not configure message format for filter data!\n");
     }
 }
 
@@ -629,40 +709,76 @@ static void configure_sensor_message_format(mip_interface* _device)
 ///
 static void packet_callback(void* _user, const mip_packet_view* _packet_view, mip_timestamp _timestamp)
 {
-    // Unused parameter
+    // Unused parameters
     (void)_user;
+    (void)_timestamp;
 
-    // Create a buffer for printing purposes
-    char field_descriptors_buffer[255] = {0};
-    int  buffer_offset                 = 0;
-
-    // Field object for iterating the packet and extracting each field
+    // Field object for iterating the packet
     mip_field_view field_view;
     mip_field_init_empty(&field_view);
 
-    // Iterate the packet and extract each field
+    // First pass: extract the device reference timestamp embedded in the packet
+    // This timestamp is set by the device at sample time (1 ns resolution, monotonic)
+    // and is far more precise than the PC receive timestamp (_timestamp)
+    uint64_t device_ns = 0;
+
     while (mip_field_next_in_packet(&field_view, _packet_view))
     {
-        buffer_offset += snprintf(
-            &field_descriptors_buffer[buffer_offset],
-            sizeof(field_descriptors_buffer) / sizeof(field_descriptors_buffer[0]) - buffer_offset,
-            " 0x%02X,",
-            mip_field_field_descriptor(&field_view)
-        );
+        if (mip_field_field_descriptor(&field_view) == MIP_DATA_DESC_SHARED_REFERENCE_TIME)
+        {
+            mip_shared_reference_timestamp_data ref_ts;
+
+            if (extract_mip_shared_reference_timestamp_data_from_field(&field_view, (void*)&ref_ts))
+            {
+                device_ns = ref_ts.nanoseconds;
+            }
+
+            break;
+        }
     }
 
-    // Trim off the last comma
-    if (buffer_offset > 0)
+    // Second pass: extract and print data fields using the device timestamp
+    mip_field_init_empty(&field_view);
+
+    while (mip_field_next_in_packet(&field_view, _packet_view))
     {
-        field_descriptors_buffer[buffer_offset - 1] = '\0';
-    }
+        if (mip_field_field_descriptor(&field_view) == MIP_DATA_DESC_SENSOR_ACCEL_SCALED)
+        {
+            mip_sensor_scaled_accel_data accel_data;
 
-    MICROSTRAIN_LOG_INFO(
-        "Received a packet at %" PRIu64 " with descriptor set 0x%02X:%s\n",
-        _timestamp,
-        mip_packet_descriptor_set(_packet_view),
-        field_descriptors_buffer
-    );
+            if (extract_mip_sensor_scaled_accel_data_from_field(&field_view, (void*)&accel_data))
+            {
+                MICROSTRAIN_LOG_INFO(
+                    "Scaled Accel at %" PRIu64 " ns (0x%02X, 0x%02X): [%9.6f, %9.6f, %9.6f] g\n",
+                    device_ns,
+                    MIP_SENSOR_DATA_DESC_SET,
+                    MIP_DATA_DESC_SENSOR_ACCEL_SCALED,
+                    accel_data.scaled_accel[0],
+                    accel_data.scaled_accel[1],
+                    accel_data.scaled_accel[2]
+                );
+            }
+        }
+        else if (mip_field_field_descriptor(&field_view) == MIP_DATA_DESC_FILTER_ATT_QUATERNION)
+        {
+            mip_filter_attitude_quaternion_data quat_data;
+
+            if (extract_mip_filter_attitude_quaternion_data_from_field(&field_view, (void*)&quat_data))
+            {
+                MICROSTRAIN_LOG_INFO(
+                    "Attitude Quat  at %" PRIu64 " ns (0x%02X, 0x%02X): [w=%9.6f, x=%9.6f, y=%9.6f, z=%9.6f] flags=0x%04X\n",
+                    device_ns,
+                    MIP_FILTER_DATA_DESC_SET,
+                    MIP_DATA_DESC_FILTER_ATT_QUATERNION,
+                    quat_data.q[0],
+                    quat_data.q[1],
+                    quat_data.q[2],
+                    quat_data.q[3],
+                    quat_data.valid_flags
+                );
+            }
+        }
+    }
 }
 
 #if USE_THREADS
