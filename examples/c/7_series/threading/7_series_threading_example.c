@@ -39,6 +39,7 @@
 #include <mip/definitions/data_shared.h>
 
 #include <inttypes.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -47,6 +48,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifndef _MSC_VER
+#include <unistd.h>  // isatty, STDIN_FILENO
+#endif // _MSC_VER
 
 #ifdef _MSC_VER
 // MSVC doesn't support pthread
@@ -73,8 +78,7 @@ void sched_yield();
 // NOTE: Setting these globally for example purposes
 
 // TODO: Update to the correct port name and baudrate
-/// @brief  Set the port name for the connecti
-.0on (Serial/USB)
+/// @brief  Set the port name for the connection (Serial/USB)
 #ifdef _WIN32
 static const char* PORT_NAME = "COM1";
 #else  // Unix
@@ -99,9 +103,15 @@ static const uint32_t RUN_TIME_SECONDS = 600;
 #define USE_THREADS true
 ////////////////////////////////////////////////////////////////////////////////
 
+/// @brief Global stop flag — set to 1 by SIGTERM/SIGINT to exit the main loop cleanly
+static volatile sig_atomic_t g_stop_requested = 0;
+
 ///
 /// @} group _7_series_threading_example_c
 ////////////////////////////////////////////////////////////////////////////////
+
+// Signal handler for clean shutdown (SIGTERM from orchestrator, SIGINT from Ctrl+C)
+static void signal_handler(int _signal);
 
 // Custom logging handler callback
 static void log_callback(void* _user, const microstrain_log_level _level, const char* _format, va_list _args);
@@ -153,6 +163,10 @@ int main(const int argc, const char* argv[])
     // Mark printf operations as unbuffered to flush with every operation
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    // Register signal handlers for clean shutdown from the Python orchestrator or Ctrl+C
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT,  signal_handler);
 
 // Note: This is a compile-time way of checking that the proper logging level is enabled
 // Note: The max available logging level may differ in pre-packaged installations of the MIP SDK
@@ -263,19 +277,24 @@ int main(const int argc, const char* argv[])
     // Get the start time of the device update loop to handle exiting the application
     const mip_timestamp loop_start_time = get_current_timestamp();
 
-    // Running loop
-    // Exit after a predetermined time in seconds
-    while (get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
+    // Running loop — exits on SIGTERM/SIGINT from the orchestrator, or after RUN_TIME_SECONDS
+    while (!g_stop_requested &&
+           get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
     {
         // Stress testing the device with ping
         // This attempts to trigger race conditions across threads
         // Note: Only one thread at a time can safely send commands
         MICROSTRAIN_LOG_WARN("Running device stress test!\n");
-        for (uint8_t counter = 0; counter < 100; ++counter)
+        for (uint8_t counter = 0; counter < 100 && !g_stop_requested; ++counter)
         {
             // Note: Sending commands calls the device update function every time
             mip_base_ping(&device);
         }
+    }
+
+    if (g_stop_requested)
+    {
+        MICROSTRAIN_LOG_INFO("Stop requested by signal — shutting down.\n");
     }
 
 #if USE_THREADS
@@ -305,6 +324,21 @@ int main(const int argc, const char* argv[])
 /// @addtogroup _7_series_threading_example_c
 /// @{
 ///
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief Signal handler for clean shutdown
+///
+/// @details Sets the global stop flag when SIGTERM or SIGINT is received.
+///          The main loop and the ping stress-test loop both check this flag
+///          so the program exits at the next safe point without corrupting data.
+///
+/// @param _signal Signal number received (SIGTERM or SIGINT)
+///
+static void signal_handler(int _signal)
+{
+    (void)_signal;
+    g_stop_requested = 1;
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 /// @brief Custom logging callback for MIP SDK message formatting and output
@@ -922,11 +956,16 @@ static void terminate(serial_port* _device_port, const char* _message, const boo
         }
     }
 
-    MICROSTRAIN_LOG_INFO("Press 'Enter' to exit the program.\n");
-
-    // Make sure the console remains open
-    const int confirm_exit = getc(stdin);
-    (void)confirm_exit; // Unused
+#ifndef _MSC_VER
+    // Only wait for user input when running in an interactive terminal.
+    // When launched from the Python orchestrator, stdin is not a tty — skip the prompt.
+    if (isatty(STDIN_FILENO))
+#endif // _MSC_VER
+    {
+        MICROSTRAIN_LOG_INFO("Press 'Enter' to exit the program.\n");
+        const int confirm_exit = getc(stdin);
+        (void)confirm_exit; // Unused
+    }
 
     if (!_successful)
     {
