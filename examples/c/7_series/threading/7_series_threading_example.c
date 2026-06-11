@@ -116,6 +116,9 @@ static void signal_handler(int _signal);
 // Custom logging handler callback
 static void log_callback(void* _user, const microstrain_log_level _level, const char* _format, va_list _args);
 
+// Capture gyro bias
+static void capture_gyro_bias(mip_interface* _device);
+
 // Used for basic timestamping (since epoch in milliseconds)
 // TODO: Update this to whatever timestamping method is desired
 static mip_timestamp get_current_timestamp();
@@ -216,6 +219,9 @@ int main(const int argc, const char* argv[])
 
     mip_interface device;
     initialize_device(&device, &device_port, BAUDRATE);
+
+    // Capture gyro bias
+    capture_gyro_bias(&device);
 
     // Configure the message format for sensor data
     configure_sensor_message_format(&device);
@@ -395,6 +401,60 @@ static void log_callback(void* _user, const microstrain_log_level _level, const 
     // Release the logging callback for other threads
     pthread_mutex_unlock(lock);
 #endif // USE_THREADS
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief Captures and configures device gyro bias
+///
+/// @param _device Pointer to the initialized MIP device interface
+///
+///
+static void capture_gyro_bias(mip_interface* _device)
+{
+    // Get the command queue so we can increase the reply timeout during the capture duration,
+    // then reset it afterward
+    mip_cmd_queue*    cmd_queue        = mip_interface_cmd_queue(_device);
+    const mip_timeout previous_timeout = mip_cmd_queue_base_reply_timeout(cmd_queue);
+    MICROSTRAIN_LOG_INFO("Initial command reply timeout is %dms.\n", previous_timeout);
+
+    // Note: The default is 15 s (15,000 ms)
+    const uint16_t capture_duration            = 15000;
+    const uint16_t increased_cmd_reply_timeout = capture_duration + 1000;
+
+    MICROSTRAIN_LOG_INFO("Increasing command reply timeout to %dms for capture gyro bias.\n", increased_cmd_reply_timeout);
+    mip_cmd_queue_set_base_reply_timeout(cmd_queue, increased_cmd_reply_timeout);
+
+    mip_vector3f gyro_bias = {
+        0.0f, // X
+        0.0f, // Y
+        0.0f  // Z
+    };
+
+    // Note: When capturing gyro bias, the device needs to remain still on a flat surface
+    MICROSTRAIN_LOG_WARN("About to capture gyro bias for %.2g seconds!\n", (float)capture_duration / 1000.0f);
+    MICROSTRAIN_LOG_WARN("Please do not move the device during this time!\n");
+    // MICROSTRAIN_LOG_WARN("Press 'Enter' when ready...");
+
+    // // Wait for anything to be entered
+    // const int confirm_capture = getc(stdin);
+    // (void)confirm_capture; // Unused
+
+    MICROSTRAIN_LOG_WARN("Capturing gyro bias...\n");
+    const mip_cmd_result cmd_result = mip_3dm_capture_gyro_bias(
+        _device,
+        capture_duration, // Capture duration (ms)
+        gyro_bias         // Gyro bias out (result of the capture)
+    );
+
+    if (!mip_cmd_result_is_ack(cmd_result))
+    {
+        exit_from_command(_device, cmd_result, "Failed to capture gyro bias!\n");
+    }
+
+    MICROSTRAIN_LOG_INFO("Capture gyro bias completed with result: [%f, %f, %f]\n", gyro_bias[0], gyro_bias[1], gyro_bias[2]);
+
+    MICROSTRAIN_LOG_INFO("Reverting command reply timeout to %dms.\n", previous_timeout);
+    mip_cmd_queue_set_base_reply_timeout(cmd_queue, previous_timeout);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -578,19 +638,19 @@ static void initialize_device(mip_interface* _device, serial_port* _device_port,
 
     // Load the default settings on the device
     // Note: This guarantees the device is in a known state
-    // MICROSTRAIN_LOG_INFO("Loading device default settings.\n");
-    // cmd_result = mip_3dm_default_device_settings(_device);
+    MICROSTRAIN_LOG_INFO("Loading device settings.\n");
+    cmd_result = mip_3dm_load_device_settings(_device);
 
-    // if (!mip_cmd_result_is_ack(cmd_result))
-    // {
-    //     // Note: Default settings will reset the baudrate to 115200 and may cause connection issues
-    //     if (cmd_result == MIP_STATUS_TIMEDOUT && BAUDRATE != 115200)
-    //     {
-    //         MICROSTRAIN_LOG_WARN("On a native serial connections the baudrate needs to be 115200 for this example to run.\n");
-    //     }
+    if (!mip_cmd_result_is_ack(cmd_result))
+    {
+        // Note: Default settings will reset the baudrate to 115200 and may cause connection issues
+        if (cmd_result == MIP_STATUS_TIMEDOUT && BAUDRATE != 460800)
+        {
+            MICROSTRAIN_LOG_WARN("On a native serial connections the baudrate needs to be 115200 for this example to run.\n");
+        }
 
-    //     exit_from_command(_device, cmd_result, "Could not load device default settings!\n");
-    // }
+        exit_from_command(_device, cmd_result, "Could not load device default settings!\n");
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
