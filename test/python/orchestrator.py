@@ -30,6 +30,7 @@ import time
 import threading
 
 import RPi.GPIO as GPIO
+import obd
 
 # ---------------------------------------------------------------------------
 # Configuration defaults (override with CLI args)
@@ -123,19 +124,89 @@ def stop_device() -> None:
 
 
 # ---------------------------------------------------------------------------
-# OBD-II velocity (placeholder — replace with python-obd implementation)
+# OBD-II velocity  (basado en obd_lector.py)
 # ---------------------------------------------------------------------------
-def read_obd_velocity() -> float:
-    """
-    Returns vehicle speed [m/s] from OBD-II.
 
-    TODO: implement with python-obd:
-        import obd
-        conn = obd.OBD()
-        r = conn.query(obd.commands.SPEED)
-        return float(r.value.to("m/s").magnitude)
+# Shared state: written by _obd_reader_thread, read by read_obd_velocity()
+_obd_speed_lock         = threading.Lock()
+_obd_speed_ms:  float   = 0.0    # última velocidad válida [m/s]
+_obd_connected: bool    = False  # True mientras el adaptador responde
+
+OBD_READ_HZ = 10    # frecuencia de consulta (límite práctico del ELM327)
+OBD_RETRY_S = 5.0   # espera entre intentos de reconexión
+
+
+def _escanear_obd() -> "obd.OBD | None":
+    """Auto-scan de puertos serie (equivalente a escanear_red en obd_lector.py)."""
+    for p in obd.scan_serial():
+        conn = obd.OBD(portstr=p, timeout=5, check_voltage=False)
+        if conn.is_connected():
+            log.info("OBD auto-detectado en %s  [%s]", p, conn.protocol_name())
+            return conn
+        log.debug("OBD: %s sin respuesta", p)
+        conn.close()
+    return None
+
+
+def _conectar_obd(port: str, baudrate: int) -> "obd.OBD | None":
+    """Conexión directa a un puerto conocido (equivalente a conectar en obd_lector.py)."""
+    conn = obd.OBD(portstr=port, baudrate=baudrate, timeout=5, check_voltage=False)
+    if conn.is_connected():
+        log.info("OBD conectado en %s @ %d baud  [%s]", port, baudrate, conn.protocol_name())
+        return conn
+    log.warning("OBD: %s no respondió", port)
+    conn.close()
+    return None
+
+
+def _obd_reader_thread(port: str | None, baudrate: int) -> None:
     """
-    return 0.0
+    Hilo daemon que lee SPEED a OBD_READ_HZ y actualiza _obd_speed_ms.
+    Reconecta automáticamente tras cualquier fallo.
+    """
+    global _obd_speed_ms, _obd_connected
+
+    conn     = None
+    interval = 1.0 / OBD_READ_HZ
+
+    while True:
+        if conn is None or not conn.is_connected():
+            log.info("OBD: conectando%s...", f" a {port}" if port else " (auto-scan)")
+            conn = _conectar_obd(port, baudrate) if port else _escanear_obd()
+            if conn is None:
+                with _obd_speed_lock:
+                    _obd_connected = False
+                    _obd_speed_ms  = 0.0
+                time.sleep(OBD_RETRY_S)
+                continue
+            with _obd_speed_lock:
+                _obd_connected = True
+
+        try:
+            resp = conn.query(obd.commands.SPEED, force=True)
+            with _obd_speed_lock:
+                if not resp.is_null():
+                    _obd_speed_ms = float(resp.value.to("m/s").magnitude)
+                # respuesta nula → conserva el último valor válido
+        except Exception as exc:
+            log.warning("OBD: error de lectura: %s — reconectando", exc)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
+            with _obd_speed_lock:
+                _obd_connected = False
+                _obd_speed_ms  = 0.0
+            continue
+
+        time.sleep(interval)
+
+
+def read_obd_velocity() -> float:
+    """Devuelve la última velocidad [m/s] leída por el hilo OBD (no bloqueante)."""
+    with _obd_speed_lock:
+        return _obd_speed_ms
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +439,9 @@ def main() -> None:
     parser.add_argument("--executable", default=DEFAULT_EXECUTABLE, help="Ruta al binario compilado")
     parser.add_argument("--start-pin",  type=int, default=DEFAULT_BTN_START, help="Pin BCM del botón START")
     parser.add_argument("--stop-pin",   type=int, default=DEFAULT_BTN_STOP,  help="Pin BCM del botón STOP")
-    parser.add_argument("--data-dir",   default=".",                         help="Directorio donde guardar los datos CSV")
+    parser.add_argument("--data-dir",     default=".",   help="Directorio donde guardar los datos CSV")
+    parser.add_argument("--obd-port",     default=None,  help="Puerto OBD (ej. /dev/ttyUSB1 o COM6) — omitir para auto-scan")
+    parser.add_argument("--obd-baudrate", type=int, default=115200, help="Baudrate del adaptador OBD")
     args = parser.parse_args()
 
     _executable_path = args.executable
@@ -392,6 +465,13 @@ def main() -> None:
         target=start_socket_server,
         daemon=True,
     ).start()
+
+    threading.Thread(
+        target=_obd_reader_thread,
+        args=(args.obd_port, args.obd_baudrate),
+        daemon=True,
+    ).start()
+    log.info("OBD: lector iniciado  puerto=%s  baudrate=%d", args.obd_port or "auto-scan", args.obd_baudrate)
 
     setup_gpio(args.start_pin, args.stop_pin)
 

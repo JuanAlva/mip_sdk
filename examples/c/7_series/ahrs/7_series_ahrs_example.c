@@ -59,13 +59,13 @@
 #ifdef _WIN32
 static const char* PORT_NAME = "COM1";
 #else  // Unix
-static const char* PORT_NAME = "/dev/ttyACM0";
+static const char* PORT_NAME = "/dev/ttyUSB0";
 #endif // _WIN32
 
 /// @brief  Set the baudrate for the connection (Serial/USB)
 /// @note For native serial connections this needs to be 115200 due to the device default settings command
 /// Use mip_base_*_comm_speed() to write and save the baudrate on the device
-static const uint32_t BAUDRATE = 115200;
+static const uint32_t BAUDRATE = 460800;
 
 // TODO: Update to the desired streaming rate. Setting low for readability purposes
 /// @brief Streaming rate in Hz
@@ -399,11 +399,11 @@ static void capture_gyro_bias(mip_interface* _device)
     // Note: When capturing gyro bias, the device needs to remain still on a flat surface
     MICROSTRAIN_LOG_WARN("About to capture gyro bias for %.2g seconds!\n", (float)capture_duration / 1000.0f);
     MICROSTRAIN_LOG_WARN("Please do not move the device during this time!\n");
-    MICROSTRAIN_LOG_WARN("Press 'Enter' when ready...");
+    // MICROSTRAIN_LOG_WARN("Press 'Enter' when ready...");
 
-    // Wait for anything to be entered
-    const int confirm_capture = getc(stdin);
-    (void)confirm_capture; // Unused
+    // // Wait for anything to be entered
+    // const int confirm_capture = getc(stdin);
+    // (void)confirm_capture; // Unused
 
     MICROSTRAIN_LOG_WARN("Capturing gyro bias...\n");
     const mip_cmd_result cmd_result = mip_3dm_capture_gyro_bias(
@@ -989,19 +989,19 @@ static void initialize_device(mip_interface* _device, serial_port* _device_port,
 
     // Load the default settings on the device
     // Note: This guarantees the device is in a known state
-    MICROSTRAIN_LOG_INFO("Loading device default settings.\n");
-    cmd_result = mip_3dm_default_device_settings(_device);
+    // MICROSTRAIN_LOG_INFO("Loading device default settings.\n");
+    // cmd_result = mip_3dm_default_device_settings(_device);
 
-    if (!mip_cmd_result_is_ack(cmd_result))
-    {
-        // Note: Default settings will reset the baudrate to 115200 and may cause connection issues
-        if (cmd_result == MIP_STATUS_TIMEDOUT && BAUDRATE != 115200)
-        {
-            MICROSTRAIN_LOG_WARN("On a native serial connections the baudrate needs to be 115200 for this example to run.\n");
-        }
+    // if (!mip_cmd_result_is_ack(cmd_result))
+    // {
+    //     // Note: Default settings will reset the baudrate to 115200 and may cause connection issues
+    //     if (cmd_result == MIP_STATUS_TIMEDOUT && BAUDRATE != 115200)
+    //     {
+    //         MICROSTRAIN_LOG_WARN("On a native serial connections the baudrate needs to be 115200 for this example to run.\n");
+    //     }
 
-        exit_from_command(_device, cmd_result, "Could not load device default settings!\n");
-    }
+    //     exit_from_command(_device, cmd_result, "Could not load device default settings!\n");
+    // }
 }
 
 ////////////////////////////////////////////////////////////////////////////////

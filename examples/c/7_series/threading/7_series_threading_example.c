@@ -50,8 +50,16 @@
 #include <time.h>
 
 #ifndef _MSC_VER
-#include <unistd.h>  // isatty, STDIN_FILENO
+#include <unistd.h>      // isatty, STDIN_FILENO, close
+#include <sys/socket.h>  // socket, connect, send
+#include <netinet/in.h>  // sockaddr_in, htons
+#include <arpa/inet.h>   // inet_pton
 #endif // _MSC_VER
+
+// On platforms without MSG_NOSIGNAL (e.g. macOS), silently drop — SIGPIPE blocked via SO_NOSIGPIPE
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif // MSG_NOSIGNAL
 
 #ifdef _MSC_VER
 // MSVC doesn't support pthread
@@ -96,15 +104,23 @@ static const uint16_t SAMPLE_RATE_HZ = 100;
 
 // TODO: Update to change the example run time
 /// @brief Example run time
-static const uint32_t RUN_TIME_SECONDS = 600;
+// static const uint32_t RUN_TIME_SECONDS = 20;
 
 // TODO: Enable/disable data collection threading
 /// @brief Use this to test the behaviors of threading
 #define USE_THREADS true
+
+/// @brief TCP host and port where the Python orchestrator data socket listens
+/// @note  Must match SOCKET_HOST / SOCKET_PORT in orchestrator.py
+#define SOCKET_HOST "127.0.0.1"
+#define SOCKET_PORT 9000
 ////////////////////////////////////////////////////////////////////////////////
 
 /// @brief Global stop flag — set to 1 by SIGTERM/SIGINT to exit the main loop cleanly
 static volatile sig_atomic_t g_stop_requested = 0;
+
+/// @brief TCP socket fd for forwarding MIP data to the Python orchestrator (-1 = not connected)
+static int g_socket_fd = -1;
 
 ///
 /// @} group _7_series_threading_example_c
@@ -112,6 +128,10 @@ static volatile sig_atomic_t g_stop_requested = 0;
 
 // Signal handler for clean shutdown (SIGTERM from orchestrator, SIGINT from Ctrl+C)
 static void signal_handler(int _signal);
+
+// Data socket — connect to the Python orchestrator and forward MIP packets
+static bool connect_data_socket(void);
+static void send_socket_msg(uint8_t _type, uint64_t _ns, const float* _values, uint16_t _flags);
 
 // Custom logging handler callback
 static void log_callback(void* _user, const microstrain_log_level _level, const char* _format, va_list _args);
@@ -255,6 +275,15 @@ int main(const int argc, const char* argv[])
         NULL                      // User data
     );
 
+    // Connect to the data forwarding socket on the Python orchestrator (non-fatal)
+#ifndef _MSC_VER
+    MICROSTRAIN_LOG_INFO("Connecting to data socket %s:%d...\n", SOCKET_HOST, SOCKET_PORT);
+    if (!connect_data_socket())
+    {
+        MICROSTRAIN_LOG_WARN("Data socket unavailable — data will only be logged locally.\n");
+    }
+#endif // _MSC_VER
+
 #if USE_THREADS
     MICROSTRAIN_LOG_INFO("Initializing the device update function for threading.\n");
     // Note: This allows the update function to be split into command and data updates across multiple threads
@@ -278,24 +307,23 @@ int main(const int argc, const char* argv[])
     }
 
     MICROSTRAIN_LOG_INFO("The device is configured... waiting for data.\n");
-    MICROSTRAIN_LOG_INFO("This example will now output data for %ds.\n", RUN_TIME_SECONDS);
+    // MICROSTRAIN_LOG_INFO("This example will now output data for %ds.\n", RUN_TIME_SECONDS);
 
     // Get the start time of the device update loop to handle exiting the application
-    const mip_timestamp loop_start_time = get_current_timestamp();
+    // const mip_timestamp loop_start_time = get_current_timestamp();
 
-    // Running loop — exits on SIGTERM/SIGINT from the orchestrator, or after RUN_TIME_SECONDS
-    while (!g_stop_requested &&
-           get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
-    {
-        // Stress testing the device with ping
-        // This attempts to trigger race conditions across threads
-        // Note: Only one thread at a time can safely send commands
-        MICROSTRAIN_LOG_WARN("Running device stress test!\n");
-        for (uint8_t counter = 0; counter < 100 && !g_stop_requested; ++counter)
-        {
-            // Note: Sending commands calls the device update function every time
-            mip_base_ping(&device);
-        }
+    // Main loop — exits on SIGTERM/SIGINT or after RUN_TIME_SECONDS
+    while (!g_stop_requested){ //&&
+    //        get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
+    // {
+#if USE_THREADS
+        // Data collection thread drives all device reads; main thread just idles
+        const struct timespec ts_idle = { .tv_sec = 0, .tv_nsec = 100 * 1000000 }; // 100 ms
+        nanosleep(&ts_idle, NULL);
+#else
+        // Without a data collection thread, drive device reads from the main loop
+        mip_interface_update(&device, 10, false);
+#endif // USE_THREADS
     }
 
     if (g_stop_requested)
@@ -321,6 +349,14 @@ int main(const int argc, const char* argv[])
     free(thread_return_code);
 #endif // USE_THREADS
 
+#ifndef _MSC_VER
+    if (g_socket_fd >= 0)
+    {
+        close(g_socket_fd);
+        g_socket_fd = -1;
+    }
+#endif // _MSC_VER
+
     terminate(&device_port, "Example Completed Successfully.\n", true);
 
     return 0;
@@ -345,6 +381,89 @@ static void signal_handler(int _signal)
     (void)_signal;
     g_stop_requested = 1;
 }
+
+#ifndef _MSC_VER
+////////////////////////////////////////////////////////////////////////////////
+/// @brief Opens a TCP connection to the Python orchestrator data socket
+///
+/// @details Connects to SOCKET_HOST:SOCKET_PORT. Non-fatal — if the server is
+///          not running, g_socket_fd stays -1 and send_socket_msg is a no-op.
+///
+/// @return True if connected successfully, false otherwise
+///
+static bool connect_data_socket(void)
+{
+    g_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (g_socket_fd < 0)
+    {
+        MICROSTRAIN_LOG_ERROR("Failed to create socket.\n");
+        return false;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(SOCKET_PORT);
+
+    if (inet_pton(AF_INET, SOCKET_HOST, &addr.sin_addr) <= 0)
+    {
+        MICROSTRAIN_LOG_ERROR("Invalid socket address: %s\n", SOCKET_HOST);
+        close(g_socket_fd);
+        g_socket_fd = -1;
+        return false;
+    }
+
+    if (connect(g_socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+    {
+        MICROSTRAIN_LOG_ERROR("Failed to connect to socket %s:%d.\n", SOCKET_HOST, SOCKET_PORT);
+        close(g_socket_fd);
+        g_socket_fd = -1;
+        return false;
+    }
+
+    MICROSTRAIN_LOG_INFO("Data socket connected to %s:%d.\n", SOCKET_HOST, SOCKET_PORT);
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief Serialises and sends one MIP data message over the TCP socket
+///
+/// @details Wire format — little-endian, 27 bytes total:
+///   Byte  0    : msg_type  (0x01 = scaled accel | 0x02 = attitude quaternion)
+///   Bytes 1–8  : device_ns (uint64_t, nanoseconds from device reference time)
+///   Bytes 9–24 : values    (4 × float32)
+///                  accel : [x, y, z, 0.0]  (units: g)
+///                  quat  : [w, x, y, z]
+///   Bytes 25–26: flags     (uint16_t, valid_flags for quat; 0 for accel)
+///
+/// If the socket is broken, it is closed and g_socket_fd is set to -1.
+///
+/// @param _type    Message type (0x01 or 0x02)
+/// @param _ns      Device reference timestamp [nanoseconds]
+/// @param _values  Four float32 values
+/// @param _flags   Valid-flags word
+///
+static void send_socket_msg(uint8_t _type, uint64_t _ns, const float* _values, uint16_t _flags)
+{
+    if (g_socket_fd < 0) return;
+
+    uint8_t buf[27];
+    size_t  off = 0;
+
+    buf[off++] = _type;
+    memcpy(buf + off, &_ns,    8);  off += 8;
+    memcpy(buf + off, _values, 16); off += 16;
+    memcpy(buf + off, &_flags, 2);
+
+    if (send(g_socket_fd, buf, sizeof(buf), MSG_NOSIGNAL) < 0)
+    {
+        // Socket broken — disable forwarding until reconnect
+        close(g_socket_fd);
+        g_socket_fd = -1;
+    }
+}
+#endif // _MSC_VER
 
 ////////////////////////////////////////////////////////////////////////////////
 /// @brief Custom logging callback for MIP SDK message formatting and output
@@ -851,6 +970,16 @@ static void packet_callback(void* _user, const mip_packet_view* _packet_view, mi
                     accel_data.scaled_accel[1],
                     accel_data.scaled_accel[2]
                 );
+
+#ifndef _MSC_VER
+                const float accel_values[4] = {
+                    accel_data.scaled_accel[0],
+                    accel_data.scaled_accel[1],
+                    accel_data.scaled_accel[2],
+                    0.0f
+                };
+                send_socket_msg(0x01, device_ns, accel_values, 0);
+#endif // _MSC_VER
             }
         }
         else if (mip_field_field_descriptor(&field_view) == MIP_DATA_DESC_FILTER_ATT_QUATERNION)
@@ -870,6 +999,16 @@ static void packet_callback(void* _user, const mip_packet_view* _packet_view, mi
                     quat_data.q[3],
                     quat_data.valid_flags
                 );
+
+#ifndef _MSC_VER
+                const float quat_values[4] = {
+                    quat_data.q[0],
+                    quat_data.q[1],
+                    quat_data.q[2],
+                    quat_data.q[3]
+                };
+                send_socket_msg(0x02, device_ns, quat_values, quat_data.valid_flags);
+#endif // _MSC_VER
             }
         }
     }

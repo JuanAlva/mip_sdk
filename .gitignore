@@ -4,5 +4,6 @@ build-doc/
 int/
 .idea/
 .vs/
+.venv/
 
 src/c/mip/mip_version.h
