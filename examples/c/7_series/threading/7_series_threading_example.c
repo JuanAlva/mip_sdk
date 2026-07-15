@@ -38,6 +38,7 @@
 #include <mip/definitions/data_sensor.h>
 #include <mip/definitions/data_shared.h>
 
+#include <assert.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -50,33 +51,25 @@
 #include <time.h>
 
 #ifndef _MSC_VER
-#include <unistd.h>      // isatty, STDIN_FILENO, close
-#include <sys/socket.h>  // socket, connect, send
-#include <netinet/in.h>  // sockaddr_in, htons
-#include <arpa/inet.h>   // inet_pton
-#endif // _MSC_VER
-
-// On platforms without MSG_NOSIGNAL (e.g. macOS), silently drop — SIGPIPE blocked via SO_NOSIGPIPE
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0
-#endif // MSG_NOSIGNAL
+#include <unistd.h> // isatty, STDIN_FILENO
+#endif              // _MSC_VER
 
 #ifdef _MSC_VER
 // MSVC doesn't support pthread
 // Wrapping basic pthread functionality through threads.h
 #include <threads.h>
-typedef thrd_t                     pthread_t;
-typedef struct pthread_attr_t      pthread_attr_t;
-typedef mtx_t                      pthread_mutex_t;
+typedef thrd_t pthread_t;
+typedef struct pthread_attr_t pthread_attr_t;
+typedef mtx_t pthread_mutex_t;
 typedef struct pthread_mutexattr_t pthread_mutexattr_t;
 
-int  pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a);
-int  pthread_mutex_destroy(pthread_mutex_t* m);
-int  pthread_mutex_lock(pthread_mutex_t* m);
-int  pthread_mutex_unlock(pthread_mutex_t* m);
-int  pthread_create(pthread_t* th, const pthread_attr_t* attr, void* (*func)(void*), void* arg);
-int  pthread_join(pthread_t t, void** res);
-int  nanosleep(const struct timespec* request, struct timespec* remain);
+int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a);
+int pthread_mutex_destroy(pthread_mutex_t *m);
+int pthread_mutex_lock(pthread_mutex_t *m);
+int pthread_mutex_unlock(pthread_mutex_t *m);
+int pthread_create(pthread_t *th, const pthread_attr_t *attr, void *(*func)(void *), void *arg);
+int pthread_join(pthread_t t, void **res);
+int nanosleep(const struct timespec *request, struct timespec *remain);
 void sched_yield();
 #else
 #include <pthread.h>
@@ -88,9 +81,9 @@ void sched_yield();
 // TODO: Update to the correct port name and baudrate
 /// @brief  Set the port name for the connection (Serial/USB)
 #ifdef _WIN32
-static const char* PORT_NAME = "COM1";
+static const char *PORT_NAME = "COM1";
 #else  // Unix
-static const char* PORT_NAME = "/dev/ttyUSB0";
+static const char *PORT_NAME = "/dev/ttyUSB0";
 #endif // _WIN32
 
 /// @brief  Set the baudrate for the connection (Serial/USB)
@@ -98,9 +91,12 @@ static const char* PORT_NAME = "/dev/ttyUSB0";
 /// Use mip_base_*_comm_speed() to write and save the baudrate on the device
 static const uint32_t BAUDRATE = 460800;
 
-// TODO: Update to the desired streaming rate. Setting low for readability purposes
-/// @brief Streaming rate in Hz
-static const uint16_t SAMPLE_RATE_HZ = 100;
+// TODO: Update to the desired streaming rates
+/// @brief Streaming rate for sensor scaled acceleration in Hz
+static const uint16_t SENSOR_SAMPLE_RATE_HZ = 100;
+
+/// @brief Streaming rate for filter attitude quaternion in Hz
+static const uint16_t FILTER_SAMPLE_RATE_HZ = 50;
 
 // TODO: Update to change the example run time
 /// @brief Example run time
@@ -109,18 +105,10 @@ static const uint16_t SAMPLE_RATE_HZ = 100;
 // TODO: Enable/disable data collection threading
 /// @brief Use this to test the behaviors of threading
 #define USE_THREADS true
-
-/// @brief TCP host and port where the Python orchestrator data socket listens
-/// @note  Must match SOCKET_HOST / SOCKET_PORT in orchestrator.py
-#define SOCKET_HOST "127.0.0.1"
-#define SOCKET_PORT 9000
 ////////////////////////////////////////////////////////////////////////////////
 
 /// @brief Global stop flag — set to 1 by SIGTERM/SIGINT to exit the main loop cleanly
 static volatile sig_atomic_t g_stop_requested = 0;
-
-/// @brief TCP socket fd for forwarding MIP data to the Python orchestrator (-1 = not connected)
-static int g_socket_fd = -1;
 
 ///
 /// @} group _7_series_threading_example_c
@@ -129,55 +117,50 @@ static int g_socket_fd = -1;
 // Signal handler for clean shutdown (SIGTERM from orchestrator, SIGINT from Ctrl+C)
 static void signal_handler(int _signal);
 
-// Data socket — connect to the Python orchestrator and forward MIP packets
-static bool connect_data_socket(void);
-static void send_socket_msg(uint8_t _type, uint64_t _ns, const float* _values, uint16_t _flags);
-
 // Custom logging handler callback
-static void log_callback(void* _user, const microstrain_log_level _level, const char* _format, va_list _args);
+static void log_callback(void *_user, const microstrain_log_level _level, const char *_format, va_list _args);
 
 // Capture gyro bias
-static void capture_gyro_bias(mip_interface* _device);
+static void capture_gyro_bias(mip_interface *_device);
 
 // Used for basic timestamping (since epoch in milliseconds)
 // TODO: Update this to whatever timestamping method is desired
 static mip_timestamp get_current_timestamp();
 
 // Device callbacks used for reading and writing packets
-static bool mip_interface_user_send_to_device(mip_interface* _device, const uint8_t* _data, size_t _length);
+static bool mip_interface_user_send_to_device(mip_interface *_device, const uint8_t *_data, size_t _length);
 static bool mip_interface_user_recv_from_device(
-    mip_interface* _device, uint8_t* _buffer, size_t _max_length, mip_timeout _wait_time, bool _from_cmd,
-    size_t* _length_out, mip_timestamp* _timestamp_out
-);
+    mip_interface *_device, uint8_t *_buffer, size_t _max_length, mip_timeout _wait_time, bool _from_cmd,
+    size_t *_length_out, mip_timestamp *_timestamp_out);
 
 // Common device initialization procedure
-static void initialize_device(mip_interface* _device, serial_port* _device_port, const uint32_t _baudrate);
+static void initialize_device(mip_interface *_device, serial_port *_device_port, const uint32_t _baudrate);
 
 // Message format configuration
-static void configure_sensor_message_format(mip_interface* _device);
-static void configure_filter_message_format(mip_interface* _device);
+static void configure_sensor_message_format(mip_interface *_device);
+static void configure_filter_message_format(mip_interface *_device);
 
 // Packet callback handler
-static void packet_callback(void* _user, const mip_packet_view* _packet_view, mip_timestamp _timestamp);
+static void packet_callback(void *_user, const mip_packet_view *_packet_view, mip_timestamp _timestamp);
 
 #if USE_THREADS
 // Basic structure for thread data
 typedef struct thread_data
 {
-    mip_interface* device;
-    volatile bool  running;
+    mip_interface *device;
+    volatile bool running;
 } thread_data_t;
 
 // Threaded functions
-static bool  update_device(mip_interface* _device, mip_timeout _wait_time, bool _from_cmd);
-static void* data_collection_thread(void* _thread_data);
+static bool update_device(mip_interface *_device, mip_timeout _wait_time, bool _from_cmd);
+static void *data_collection_thread(void *_thread_data);
 #endif // USE_THREADS
 
 // Utility functions the handle application closing and printing error messages
-static void terminate(serial_port* _device_port, const char* _message, const bool _successful);
-static void exit_from_command(const mip_interface* _device, const mip_cmd_result _cmd_result, const char* _format, ...);
+static void terminate(serial_port *_device_port, const char *_message, const bool _successful);
+static void exit_from_command(const mip_interface *_device, const mip_cmd_result _cmd_result, const char *_format, ...);
 
-int main(const int argc, const char* argv[])
+int main(const int argc, const char *argv[])
 {
     // Unused parameters
     (void)argc;
@@ -189,7 +172,7 @@ int main(const int argc, const char* argv[])
 
     // Register signal handlers for clean shutdown from the Python orchestrator or Ctrl+C
     signal(SIGTERM, signal_handler);
-    signal(SIGINT,  signal_handler);
+    signal(SIGINT, signal_handler);
 
 // Note: This is a compile-time way of checking that the proper logging level is enabled
 // Note: The max available logging level may differ in pre-packaged installations of the MIP SDK
@@ -219,7 +202,7 @@ int main(const int argc, const char* argv[])
     // Note: The logging level parameter doesn't need to match the max logging level.
     // If the parameter is higher than the max level, higher-level logging functions will be ignored
 #if USE_THREADS
-    MICROSTRAIN_LOG_INIT(&log_callback, MICROSTRAIN_LOG_LEVEL_INFO, (void*)&lock);
+    MICROSTRAIN_LOG_INIT(&log_callback, MICROSTRAIN_LOG_LEVEL_INFO, (void *)&lock);
 #else
     MICROSTRAIN_LOG_INIT(&log_callback, MICROSTRAIN_LOG_LEVEL_INFO, NULL);
 #endif // USE_THREADS
@@ -275,15 +258,6 @@ int main(const int argc, const char* argv[])
         NULL                      // User data
     );
 
-    // Connect to the data forwarding socket on the Python orchestrator (non-fatal)
-#ifndef _MSC_VER
-    MICROSTRAIN_LOG_INFO("Connecting to data socket %s:%d...\n", SOCKET_HOST, SOCKET_PORT);
-    if (!connect_data_socket())
-    {
-        MICROSTRAIN_LOG_WARN("Data socket unavailable — data will only be logged locally.\n");
-    }
-#endif // _MSC_VER
-
 #if USE_THREADS
     MICROSTRAIN_LOG_INFO("Initializing the device update function for threading.\n");
     // Note: This allows the update function to be split into command and data updates across multiple threads
@@ -293,7 +267,7 @@ int main(const int argc, const char* argv[])
 
     MICROSTRAIN_LOG_INFO("Creating the data collection thread.\n");
     pthread_t data_thread;
-    pthread_create(&data_thread, NULL, data_collection_thread, (void*)&data);
+    pthread_create(&data_thread, NULL, data_collection_thread, (void *)&data);
 #endif // USE_THREADS
 
     // Resume the device
@@ -313,15 +287,16 @@ int main(const int argc, const char* argv[])
     // const mip_timestamp loop_start_time = get_current_timestamp();
 
     // Main loop — exits on SIGTERM/SIGINT or after RUN_TIME_SECONDS
-    while (!g_stop_requested){ //&&
-    //        get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
-    // {
+    while (!g_stop_requested)
+    { //&&
+      //        get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
+      // {
 #if USE_THREADS
-        // Data collection thread drives all device reads; main thread just idles
-        const struct timespec ts_idle = { .tv_sec = 0, .tv_nsec = 100 * 1000000 }; // 100 ms
+      // Data collection thread drives all device reads; main thread just idles
+        const struct timespec ts_idle = {.tv_sec = 0, .tv_nsec = 100 * 1000000}; // 100 ms
         nanosleep(&ts_idle, NULL);
 #else
-        // Without a data collection thread, drive device reads from the main loop
+      // Without a data collection thread, drive device reads from the main loop
         mip_interface_update(&device, 10, false);
 #endif // USE_THREADS
     }
@@ -337,7 +312,7 @@ int main(const int argc, const char* argv[])
 
     // Join the thread back before exiting the program
     MICROSTRAIN_LOG_INFO("Waiting for the thread to join.\n");
-    void* thread_return_code = NULL; // Return code from the thread function (Unused)
+    void *thread_return_code = NULL; // Return code from the thread function (Unused)
     if (pthread_join(data_thread, &thread_return_code) != 0)
     {
         pthread_mutex_destroy(&lock);
@@ -348,14 +323,6 @@ int main(const int argc, const char* argv[])
     pthread_mutex_destroy(&lock);
     free(thread_return_code);
 #endif // USE_THREADS
-
-#ifndef _MSC_VER
-    if (g_socket_fd >= 0)
-    {
-        close(g_socket_fd);
-        g_socket_fd = -1;
-    }
-#endif // _MSC_VER
 
     terminate(&device_port, "Example Completed Successfully.\n", true);
 
@@ -382,89 +349,6 @@ static void signal_handler(int _signal)
     g_stop_requested = 1;
 }
 
-#ifndef _MSC_VER
-////////////////////////////////////////////////////////////////////////////////
-/// @brief Opens a TCP connection to the Python orchestrator data socket
-///
-/// @details Connects to SOCKET_HOST:SOCKET_PORT. Non-fatal — if the server is
-///          not running, g_socket_fd stays -1 and send_socket_msg is a no-op.
-///
-/// @return True if connected successfully, false otherwise
-///
-static bool connect_data_socket(void)
-{
-    g_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-
-    if (g_socket_fd < 0)
-    {
-        MICROSTRAIN_LOG_ERROR("Failed to create socket.\n");
-        return false;
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(SOCKET_PORT);
-
-    if (inet_pton(AF_INET, SOCKET_HOST, &addr.sin_addr) <= 0)
-    {
-        MICROSTRAIN_LOG_ERROR("Invalid socket address: %s\n", SOCKET_HOST);
-        close(g_socket_fd);
-        g_socket_fd = -1;
-        return false;
-    }
-
-    if (connect(g_socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
-    {
-        MICROSTRAIN_LOG_ERROR("Failed to connect to socket %s:%d.\n", SOCKET_HOST, SOCKET_PORT);
-        close(g_socket_fd);
-        g_socket_fd = -1;
-        return false;
-    }
-
-    MICROSTRAIN_LOG_INFO("Data socket connected to %s:%d.\n", SOCKET_HOST, SOCKET_PORT);
-    return true;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// @brief Serialises and sends one MIP data message over the TCP socket
-///
-/// @details Wire format — little-endian, 27 bytes total:
-///   Byte  0    : msg_type  (0x01 = scaled accel | 0x02 = attitude quaternion)
-///   Bytes 1–8  : device_ns (uint64_t, nanoseconds from device reference time)
-///   Bytes 9–24 : values    (4 × float32)
-///                  accel : [x, y, z, 0.0]  (units: g)
-///                  quat  : [w, x, y, z]
-///   Bytes 25–26: flags     (uint16_t, valid_flags for quat; 0 for accel)
-///
-/// If the socket is broken, it is closed and g_socket_fd is set to -1.
-///
-/// @param _type    Message type (0x01 or 0x02)
-/// @param _ns      Device reference timestamp [nanoseconds]
-/// @param _values  Four float32 values
-/// @param _flags   Valid-flags word
-///
-static void send_socket_msg(uint8_t _type, uint64_t _ns, const float* _values, uint16_t _flags)
-{
-    if (g_socket_fd < 0) return;
-
-    uint8_t buf[27];
-    size_t  off = 0;
-
-    buf[off++] = _type;
-    memcpy(buf + off, &_ns,    8);  off += 8;
-    memcpy(buf + off, _values, 16); off += 16;
-    memcpy(buf + off, &_flags, 2);
-
-    if (send(g_socket_fd, buf, sizeof(buf), MSG_NOSIGNAL) < 0)
-    {
-        // Socket broken — disable forwarding until reconnect
-        close(g_socket_fd);
-        g_socket_fd = -1;
-    }
-}
-#endif // _MSC_VER
-
 ////////////////////////////////////////////////////////////////////////////////
 /// @brief Custom logging callback for MIP SDK message formatting and output
 ///
@@ -478,10 +362,10 @@ static void send_socket_msg(uint8_t _type, uint64_t _ns, const float* _values, u
 /// @param _format Printf-style format string for the message
 /// @param _args Variable argument list containing message parameters
 ///
-static void log_callback(void* _user, const microstrain_log_level _level, const char* _format, va_list _args)
+static void log_callback(void *_user, const microstrain_log_level _level, const char *_format, va_list _args)
 {
 #if USE_THREADS
-    pthread_mutex_t* lock = (pthread_mutex_t*)_user;
+    pthread_mutex_t *lock = (pthread_mutex_t *)_user;
     assert(lock);
 
     // Lock the mutex since the callbacks can happen across threads
@@ -493,27 +377,27 @@ static void log_callback(void* _user, const microstrain_log_level _level, const 
 
     switch (_level)
     {
-        case MICROSTRAIN_LOG_LEVEL_FATAL:
-        case MICROSTRAIN_LOG_LEVEL_ERROR:
-        {
-            fprintf(stderr, "%s: ", microstrain_logging_level_name(_level));
-            vfprintf(stderr, _format, _args);
-            break;
-        }
-        case MICROSTRAIN_LOG_LEVEL_WARN:
-        case MICROSTRAIN_LOG_LEVEL_INFO:
-        case MICROSTRAIN_LOG_LEVEL_DEBUG:
-        case MICROSTRAIN_LOG_LEVEL_TRACE:
-        {
-            fprintf(stdout, "%s: ", microstrain_logging_level_name(_level));
-            vfprintf(stdout, _format, _args);
-            break;
-        }
-        case MICROSTRAIN_LOG_LEVEL_OFF:
-        default:
-        {
-            break;
-        }
+    case MICROSTRAIN_LOG_LEVEL_FATAL:
+    case MICROSTRAIN_LOG_LEVEL_ERROR:
+    {
+        fprintf(stderr, "%s: ", microstrain_logging_level_name(_level));
+        vfprintf(stderr, _format, _args);
+        break;
+    }
+    case MICROSTRAIN_LOG_LEVEL_WARN:
+    case MICROSTRAIN_LOG_LEVEL_INFO:
+    case MICROSTRAIN_LOG_LEVEL_DEBUG:
+    case MICROSTRAIN_LOG_LEVEL_TRACE:
+    {
+        fprintf(stdout, "%s: ", microstrain_logging_level_name(_level));
+        vfprintf(stdout, _format, _args);
+        break;
+    }
+    case MICROSTRAIN_LOG_LEVEL_OFF:
+    default:
+    {
+        break;
+    }
     }
 
 #if USE_THREADS
@@ -528,16 +412,16 @@ static void log_callback(void* _user, const microstrain_log_level _level, const 
 /// @param _device Pointer to the initialized MIP device interface
 ///
 ///
-static void capture_gyro_bias(mip_interface* _device)
+static void capture_gyro_bias(mip_interface *_device)
 {
     // Get the command queue so we can increase the reply timeout during the capture duration,
     // then reset it afterward
-    mip_cmd_queue*    cmd_queue        = mip_interface_cmd_queue(_device);
+    mip_cmd_queue *cmd_queue = mip_interface_cmd_queue(_device);
     const mip_timeout previous_timeout = mip_cmd_queue_base_reply_timeout(cmd_queue);
     MICROSTRAIN_LOG_INFO("Initial command reply timeout is %dms.\n", previous_timeout);
 
     // Note: The default is 15 s (15,000 ms)
-    const uint16_t capture_duration            = 15000;
+    const uint16_t capture_duration = 15000;
     const uint16_t increased_cmd_reply_timeout = capture_duration + 1000;
 
     MICROSTRAIN_LOG_INFO("Increasing command reply timeout to %dms for capture gyro bias.\n", increased_cmd_reply_timeout);
@@ -617,10 +501,10 @@ static mip_timestamp get_current_timestamp()
 ///
 /// @return True if send was successful, false otherwise
 ///
-static bool mip_interface_user_send_to_device(mip_interface* _device, const uint8_t* _data, size_t _length)
+static bool mip_interface_user_send_to_device(mip_interface *_device, const uint8_t *_data, size_t _length)
 {
     // Extract the serial port pointer that was used in the callback initialization
-    serial_port* device_port = (serial_port*)mip_interface_user_pointer(_device);
+    serial_port *device_port = (serial_port *)mip_interface_user_pointer(_device);
 
     if (device_port == NULL)
     {
@@ -655,15 +539,14 @@ static bool mip_interface_user_send_to_device(mip_interface* _device, const uint
 /// @return True if receive was successful, false otherwise
 ///
 static bool mip_interface_user_recv_from_device(
-    mip_interface* _device, uint8_t* _buffer, size_t _max_length, mip_timeout _wait_time, bool _from_cmd,
-    size_t* _length_out, mip_timestamp* _timestamp_out
-)
+    mip_interface *_device, uint8_t *_buffer, size_t _max_length, mip_timeout _wait_time, bool _from_cmd,
+    size_t *_length_out, mip_timestamp *_timestamp_out)
 {
     // Unused parameter
     (void)_from_cmd;
 
     // Extract the serial port pointer that was used in the callback initialization
-    serial_port* device_port = (serial_port*)mip_interface_user_pointer(_device);
+    serial_port *device_port = (serial_port *)mip_interface_user_pointer(_device);
 
     if (device_port == NULL)
     {
@@ -694,7 +577,7 @@ static bool mip_interface_user_recv_from_device(
 ///                     communication
 /// @param _baudrate Serial communication baudrate for the device
 ///
-static void initialize_device(mip_interface* _device, serial_port* _device_port, const uint32_t _baudrate)
+static void initialize_device(mip_interface *_device, serial_port *_device_port, const uint32_t _baudrate)
 {
     MICROSTRAIN_LOG_INFO("Initializing the device interface.\n");
     mip_interface_init(
@@ -704,7 +587,7 @@ static void initialize_device(mip_interface* _device, serial_port* _device_port,
         &mip_interface_user_send_to_device,   // User-defined send packet callback
         &mip_interface_user_recv_from_device, // User-defined receive packet callback
         &mip_interface_default_update,        // Default update callback
-        (void*)_device_port                   // Cast the device port for use in the callbacks
+        (void *)_device_port                  // Cast the device port for use in the callbacks
     );
 
     // Ping the device
@@ -726,6 +609,40 @@ static void initialize_device(mip_interface* _device, serial_port* _device_port,
     {
         exit_from_command(_device, cmd_result, "Could not set the device to idle!\n");
     }
+
+    // Run the built-in test (BIT)
+    // Note: The BIT runs full self-diagnostics and can take several seconds, which is
+    // longer than the default 2000 ms reply timeout. Raise the reply timeout for the
+    // duration of the command and restore it afterward (same technique as capture_gyro_bias).
+    mip_cmd_queue *cmd_queue = mip_interface_cmd_queue(_device);
+    const mip_timeout previous_timeout = mip_cmd_queue_base_reply_timeout(cmd_queue);
+    
+    MICROSTRAIN_LOG_INFO("Initial command reply timeout is %dms (raising reply timeout to 5000ms).\n", previous_timeout);
+    mip_cmd_queue_set_base_reply_timeout(cmd_queue, 5000);
+
+    uint32_t bit_result = 0;
+    cmd_result = mip_base_built_in_test(_device, &bit_result);
+
+    // 1. ¿El comando se ejecutó correctamente?
+    if (!mip_cmd_result_is_ack(cmd_result))
+    {
+        MICROSTRAIN_LOG_ERROR(
+            "El comando BIT falló: (%d) %s\n",
+            cmd_result, mip_cmd_result_to_string(cmd_result));
+        // manejar el error (p. ej. exit_from_command en el ejemplo threading)
+    }
+    
+    // 2. El comando respondió ACK -> revisar el resultado del test
+    if (bit_result != 0)
+    {
+        // Algún autodiagnóstico falló; los bits se decodifican con el manual del equipo
+        MICROSTRAIN_LOG_WARN("BIT reportó fallos: 0x%08" PRIX32 "\n", bit_result);
+    }
+    else
+    {
+        MICROSTRAIN_LOG_INFO("BIT OK: todos los tests pasaron.\n");
+    }
+    mip_cmd_queue_set_base_reply_timeout(cmd_queue, previous_timeout);
 
     // Print device info to make sure the correct device is being used
     MICROSTRAIN_LOG_INFO("Getting the device information.\n");
@@ -784,13 +701,13 @@ static void initialize_device(mip_interface* _device, serial_port* _device_port,
 ///
 /// @param _device Pointer to the initialized MIP device interface
 ///
-static void configure_sensor_message_format(mip_interface* _device)
+static void configure_sensor_message_format(mip_interface *_device)
 {
     // Note: Querying the device base rate is only one way to calculate the descriptor decimation
     // We could have also set it directly with information from the datasheet
 
     MICROSTRAIN_LOG_INFO("Getting the base rate for sensor data.\n");
-    uint16_t       sensor_base_rate;
+    uint16_t sensor_base_rate;
     mip_cmd_result cmd_result = mip_3dm_get_base_rate(
         _device,
         MIP_SENSOR_DATA_DESC_SET, // Data descriptor set
@@ -804,31 +721,28 @@ static void configure_sensor_message_format(mip_interface* _device)
 
     // Supported sample rates can be any value from 1 up to the base rate
     // Note: Decimation can be anything from 1 to 65,565 (uint16_t::max)
-    if (SAMPLE_RATE_HZ == 0 || SAMPLE_RATE_HZ > sensor_base_rate)
+    if (SENSOR_SAMPLE_RATE_HZ == 0 || SENSOR_SAMPLE_RATE_HZ > sensor_base_rate)
     {
         exit_from_command(
             _device,
             MIP_NACK_INVALID_PARAM,
             "Invalid sample rate of %dHz! Supported rates are [1, %d].\n",
-            SAMPLE_RATE_HZ,
-            sensor_base_rate
-        );
+            SENSOR_SAMPLE_RATE_HZ,
+            sensor_base_rate);
     }
 
     // Calculate the decimation (stream rate) for the device based on its base rate
-    const uint16_t sensor_decimation = sensor_base_rate / SAMPLE_RATE_HZ;
+    const uint16_t sensor_decimation = sensor_base_rate / SENSOR_SAMPLE_RATE_HZ;
     MICROSTRAIN_LOG_INFO(
         "Decimating sensor base rate %d by %d to stream data at %dHz.\n",
         sensor_base_rate,
         sensor_decimation,
-        SAMPLE_RATE_HZ
-    );
+        SENSOR_SAMPLE_RATE_HZ);
 
     // Descriptor rate is a pair of data descriptor set and decimation
     const mip_descriptor_rate sensor_descriptors[2] = {
         {MIP_DATA_DESC_SHARED_REFERENCE_TIME, sensor_decimation}, // Device internal timestamp (ns)
-        {MIP_DATA_DESC_SENSOR_ACCEL_SCALED,   sensor_decimation}
-    };
+        {MIP_DATA_DESC_SENSOR_ACCEL_SCALED, sensor_decimation}};
 
     MICROSTRAIN_LOG_INFO("Configuring message format for sensor data.\n");
     cmd_result = mip_3dm_write_message_format(
@@ -852,10 +766,10 @@ static void configure_sensor_message_format(mip_interface* _device)
 ///
 /// @param _device Pointer to the initialized MIP device interface
 ///
-static void configure_filter_message_format(mip_interface* _device)
+static void configure_filter_message_format(mip_interface *_device)
 {
     MICROSTRAIN_LOG_INFO("Getting the base rate for filter data.\n");
-    uint16_t       filter_base_rate;
+    uint16_t filter_base_rate;
     mip_cmd_result cmd_result = mip_3dm_get_base_rate(
         _device,
         MIP_FILTER_DATA_DESC_SET, // Data descriptor set
@@ -867,36 +781,33 @@ static void configure_filter_message_format(mip_interface* _device)
         exit_from_command(_device, cmd_result, "Could not get the base rate for filter data!\n");
     }
 
-    if (SAMPLE_RATE_HZ == 0 || SAMPLE_RATE_HZ > filter_base_rate)
+    if (FILTER_SAMPLE_RATE_HZ == 0 || FILTER_SAMPLE_RATE_HZ > filter_base_rate)
     {
         exit_from_command(
             _device,
             MIP_NACK_INVALID_PARAM,
             "Invalid sample rate of %dHz! Supported rates are [1, %d].\n",
-            SAMPLE_RATE_HZ,
-            filter_base_rate
-        );
+            FILTER_SAMPLE_RATE_HZ,
+            filter_base_rate);
     }
 
-    const uint16_t filter_decimation = filter_base_rate / SAMPLE_RATE_HZ;
+    const uint16_t filter_decimation = filter_base_rate / FILTER_SAMPLE_RATE_HZ;
     MICROSTRAIN_LOG_INFO(
         "Decimating filter base rate %d by %d to stream data at %dHz.\n",
         filter_base_rate,
         filter_decimation,
-        SAMPLE_RATE_HZ
-    );
+        FILTER_SAMPLE_RATE_HZ);
 
     const mip_descriptor_rate filter_descriptors[2] = {
-        {MIP_DATA_DESC_SHARED_REFERENCE_TIME,  filter_decimation}, // Device internal timestamp (ns)
-        {MIP_DATA_DESC_FILTER_ATT_QUATERNION,  filter_decimation}
-    };
+        {MIP_DATA_DESC_SHARED_REFERENCE_TIME, filter_decimation}, // Device internal timestamp (ns)
+        {MIP_DATA_DESC_FILTER_ATT_QUATERNION, filter_decimation}};
 
     MICROSTRAIN_LOG_INFO("Configuring message format for filter data.\n");
     cmd_result = mip_3dm_write_message_format(
         _device,
-        MIP_FILTER_DATA_DESC_SET,                                       // Data descriptor set
-        sizeof(filter_descriptors) / sizeof(filter_descriptors[0]),     // Number of descriptors
-        filter_descriptors                                              // Descriptor array
+        MIP_FILTER_DATA_DESC_SET,                                   // Data descriptor set
+        sizeof(filter_descriptors) / sizeof(filter_descriptors[0]), // Number of descriptors
+        filter_descriptors                                          // Descriptor array
     );
 
     if (!mip_cmd_result_is_ack(cmd_result))
@@ -920,7 +831,7 @@ static void configure_filter_message_format(mip_interface* _device)
 /// @param _packet_view Pointer to the received MIP packet
 /// @param _timestamp Timestamp when the packet was received
 ///
-static void packet_callback(void* _user, const mip_packet_view* _packet_view, mip_timestamp _timestamp)
+static void packet_callback(void *_user, const mip_packet_view *_packet_view, mip_timestamp _timestamp)
 {
     // Unused parameters
     (void)_user;
@@ -941,7 +852,7 @@ static void packet_callback(void* _user, const mip_packet_view* _packet_view, mi
         {
             mip_shared_reference_timestamp_data ref_ts;
 
-            if (extract_mip_shared_reference_timestamp_data_from_field(&field_view, (void*)&ref_ts))
+            if (extract_mip_shared_reference_timestamp_data_from_field(&field_view, (void *)&ref_ts))
             {
                 device_ns = ref_ts.nanoseconds;
             }
@@ -959,7 +870,7 @@ static void packet_callback(void* _user, const mip_packet_view* _packet_view, mi
         {
             mip_sensor_scaled_accel_data accel_data;
 
-            if (extract_mip_sensor_scaled_accel_data_from_field(&field_view, (void*)&accel_data))
+            if (extract_mip_sensor_scaled_accel_data_from_field(&field_view, (void *)&accel_data))
             {
                 MICROSTRAIN_LOG_INFO(
                     "Scaled Accel at %" PRIu64 " ns (0x%02X, 0x%02X): [%9.6f, %9.6f, %9.6f] g\n",
@@ -968,25 +879,14 @@ static void packet_callback(void* _user, const mip_packet_view* _packet_view, mi
                     MIP_DATA_DESC_SENSOR_ACCEL_SCALED,
                     accel_data.scaled_accel[0],
                     accel_data.scaled_accel[1],
-                    accel_data.scaled_accel[2]
-                );
-
-#ifndef _MSC_VER
-                const float accel_values[4] = {
-                    accel_data.scaled_accel[0],
-                    accel_data.scaled_accel[1],
-                    accel_data.scaled_accel[2],
-                    0.0f
-                };
-                send_socket_msg(0x01, device_ns, accel_values, 0);
-#endif // _MSC_VER
+                    accel_data.scaled_accel[2]);
             }
         }
         else if (mip_field_field_descriptor(&field_view) == MIP_DATA_DESC_FILTER_ATT_QUATERNION)
         {
             mip_filter_attitude_quaternion_data quat_data;
 
-            if (extract_mip_filter_attitude_quaternion_data_from_field(&field_view, (void*)&quat_data))
+            if (extract_mip_filter_attitude_quaternion_data_from_field(&field_view, (void *)&quat_data))
             {
                 MICROSTRAIN_LOG_INFO(
                     "Attitude Quat  at %" PRIu64 " ns (0x%02X, 0x%02X): [w=%9.6f, x=%9.6f, y=%9.6f, z=%9.6f] flags=0x%04X\n",
@@ -997,18 +897,7 @@ static void packet_callback(void* _user, const mip_packet_view* _packet_view, mi
                     quat_data.q[1],
                     quat_data.q[2],
                     quat_data.q[3],
-                    quat_data.valid_flags
-                );
-
-#ifndef _MSC_VER
-                const float quat_values[4] = {
-                    quat_data.q[0],
-                    quat_data.q[1],
-                    quat_data.q[2],
-                    quat_data.q[3]
-                };
-                send_socket_msg(0x02, device_ns, quat_values, quat_data.valid_flags);
-#endif // _MSC_VER
+                    quat_data.valid_flags);
             }
         }
     }
@@ -1035,7 +924,7 @@ static void packet_callback(void* _user, const mip_packet_view* _packet_view, mi
 ///          Always returns true when called from commands to avoid race
 ///          conditions.
 ///
-static bool update_device(mip_interface* _device, mip_timeout _wait_time, bool _from_cmd)
+static bool update_device(mip_interface *_device, mip_timeout _wait_time, bool _from_cmd)
 {
     // Do normal updates only if not called from a command handler
     // Note: This is the separation between the main/other thread and the data collection thread
@@ -1046,7 +935,7 @@ static bool update_device(mip_interface* _device, mip_timeout _wait_time, bool _
 
     // Create a 5-millisecond timeout
     const struct timespec ts = {
-        .tv_sec  = 0,          // 0 Seconds
+        .tv_sec = 0,           // 0 Seconds
         .tv_nsec = 5 * 1000000 // 5 Milliseconds
     };
 
@@ -1076,11 +965,11 @@ static bool update_device(mip_interface* _device, mip_timeout _wait_time, bool _
 ///
 /// @returns NULL (return value unused)
 ///
-static void* data_collection_thread(void* _thread_data)
+static void *data_collection_thread(void *_thread_data)
 {
     MICROSTRAIN_LOG_INFO("Data collection thread created!\n");
 
-    const thread_data_t* thread_data = (thread_data_t*)_thread_data;
+    const thread_data_t *thread_data = (thread_data_t *)_thread_data;
 
     while (thread_data->running)
     {
@@ -1096,7 +985,7 @@ static void* data_collection_thread(void* _thread_data)
         if (!updated)
         {
             // Avoid deadlocks if the connection is closed
-            mip_cmd_queue* cmd_queue = mip_interface_cmd_queue(thread_data->device);
+            mip_cmd_queue *cmd_queue = mip_interface_cmd_queue(thread_data->device);
             assert(cmd_queue);
             mip_cmd_queue_clear(cmd_queue);
 
@@ -1123,7 +1012,7 @@ static void* data_collection_thread(void* _thread_data)
 /// @param _message Error message to display
 /// @param _successful Whether termination is due to success or failure
 ///
-static void terminate(serial_port* _device_port, const char* _message, const bool _successful)
+static void terminate(serial_port *_device_port, const char *_message, const bool _successful)
 {
     if (_message != NULL && strlen(_message) != 0)
     {
@@ -1185,7 +1074,7 @@ static void terminate(serial_port* _device_port, const char* _message, const boo
 /// @param _format Printf-style format string for error message
 /// @param ... Variable arguments for format string
 ///
-static void exit_from_command(const mip_interface* _device, const mip_cmd_result _cmd_result, const char* _format, ...)
+static void exit_from_command(const mip_interface *_device, const mip_cmd_result _cmd_result, const char *_format, ...)
 {
     if (_format != NULL && strlen(_format) != 0)
     {
@@ -1204,7 +1093,7 @@ static void exit_from_command(const mip_interface* _device, const mip_cmd_result
     else
     {
         // Get the connection pointer that was set during device initialization
-        serial_port* device_port = (serial_port*)mip_interface_user_pointer(_device);
+        serial_port *device_port = (serial_port *)mip_interface_user_pointer(_device);
 
         terminate(device_port, "", false);
     }
@@ -1218,7 +1107,7 @@ static void exit_from_command(const mip_interface* _device, const mip_cmd_result
 // threads.h wrappers for unsupported pthread functionality used in this example
 
 // threads.h wrapper for pthread pthread_mutex_init
-int pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a)
+int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a)
 {
     // Unused parameter
     (void)a;
@@ -1228,26 +1117,26 @@ int pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a)
 }
 
 // threads.h wrapper for pthread pthread_mutex_destroy
-int pthread_mutex_destroy(pthread_mutex_t* m)
+int pthread_mutex_destroy(pthread_mutex_t *m)
 {
     mtx_destroy(m);
     return 0;
 }
 
 // threads.h wrapper for pthread pthread_mutex_lock
-int pthread_mutex_lock(pthread_mutex_t* m)
+int pthread_mutex_lock(pthread_mutex_t *m)
 {
     return mtx_lock(m);
 }
 
 // threads.h wrapper for pthread pthread_mutex_unlock
-int pthread_mutex_unlock(pthread_mutex_t* m)
+int pthread_mutex_unlock(pthread_mutex_t *m)
 {
     return mtx_unlock(m);
 }
 
 // threads.h wrapper for pthread pthread_create
-int pthread_create(pthread_t* th, const pthread_attr_t* attr, void* (*func)(void*), void* arg)
+int pthread_create(pthread_t *th, const pthread_attr_t *attr, void *(*func)(void *), void *arg)
 {
     // Unused parameter
     (void)attr;
@@ -1256,14 +1145,14 @@ int pthread_create(pthread_t* th, const pthread_attr_t* attr, void* (*func)(void
 }
 
 // threads.h wrapper for pthread pthread_join
-int pthread_join(pthread_t t, void** res)
+int pthread_join(pthread_t t, void **res)
 {
     *res = malloc(sizeof(int));
     return thrd_join(t, *res);
 }
 
 // sleep wrapper for pthread nanosleep
-int nanosleep(const struct timespec* request, struct timespec* remain)
+int nanosleep(const struct timespec *request, struct timespec *remain)
 {
     // Sleep for some duration
     return thrd_sleep(request, remain);
