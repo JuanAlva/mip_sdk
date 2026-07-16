@@ -34,6 +34,7 @@
 #include <mip/mip_interface.h>
 #include <mip/definitions/commands_3dm.h>
 #include <mip/definitions/commands_base.h>
+#include <mip/definitions/commands_filter.h>
 #include <mip/definitions/data_filter.h>
 #include <mip/definitions/data_sensor.h>
 #include <mip/definitions/data_shared.h>
@@ -100,7 +101,7 @@ static const uint16_t FILTER_SAMPLE_RATE_HZ = 50;
 
 // TODO: Update to change the example run time
 /// @brief Example run time
-// static const uint32_t RUN_TIME_SECONDS = 20;
+static const uint32_t RUN_TIME_SECONDS = 5;
 
 // TODO: Enable/disable data collection threading
 /// @brief Use this to test the behaviors of threading
@@ -135,6 +136,9 @@ static bool mip_interface_user_recv_from_device(
 
 // Common device initialization procedure
 static void initialize_device(mip_interface *_device, serial_port *_device_port, const uint32_t _baudrate);
+
+//
+static void initialize_estimation_filter(mip_interface *_device);
 
 // Message format configuration
 static void configure_sensor_message_format(mip_interface *_device);
@@ -226,6 +230,8 @@ int main(const int argc, const char *argv[])
     // Capture gyro bias
     capture_gyro_bias(&device);
 
+    initialize_estimation_filter(&device);
+
     // Configure the message format for sensor data
     configure_sensor_message_format(&device);
 
@@ -281,22 +287,30 @@ int main(const int argc, const char *argv[])
     }
 
     MICROSTRAIN_LOG_INFO("The device is configured... waiting for data.\n");
-    // MICROSTRAIN_LOG_INFO("This example will now output data for %ds.\n", RUN_TIME_SECONDS);
+    MICROSTRAIN_LOG_INFO("This example will now output data for %ds.\n", RUN_TIME_SECONDS);
 
     // Get the start time of the device update loop to handle exiting the application
-    // const mip_timestamp loop_start_time = get_current_timestamp();
+    const mip_timestamp loop_start_time = get_current_timestamp();
 
     // Main loop — exits on SIGTERM/SIGINT or after RUN_TIME_SECONDS
-    while (!g_stop_requested)
-    { //&&
-      //        get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
-      // {
+    // while (!g_stop_requested)
+    while (get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
+    {
+        // Stress testing the device with ping
+        // This attempts to trigger race conditions across threads
+        // Note: Only one thread at a time can safely send commands
+        MICROSTRAIN_LOG_WARN("Running device stress test!\n");
+        for (uint8_t counter = 0; counter < 100; ++counter)
+        {
+            // Note: Sending commands calls the device update function every time
+            mip_base_ping(&device);
+        }
 #if USE_THREADS
-      // Data collection thread drives all device reads; main thread just idles
+        // Data collection thread drives all device reads; main thread just idles
         const struct timespec ts_idle = {.tv_sec = 0, .tv_nsec = 100 * 1000000}; // 100 ms
         nanosleep(&ts_idle, NULL);
 #else
-      // Without a data collection thread, drive device reads from the main loop
+        // Without a data collection thread, drive device reads from the main loop
         mip_interface_update(&device, 10, false);
 #endif // USE_THREADS
     }
@@ -460,6 +474,83 @@ static void capture_gyro_bias(mip_interface *_device)
     mip_cmd_queue_set_base_reply_timeout(cmd_queue, previous_timeout);
 }
 
+/**
+ * @brief Reset the attitude
+ *
+ * @param _device
+ */
+static void initialize_estimation_filter(mip_interface *_device)
+{
+    mip_cmd_result cmd_result = mip_filter_reset(_device);
+
+    if (!mip_cmd_result_is_ack(cmd_result))
+    {
+        exit_from_command(_device, cmd_result, "Failed to reset filter.\n");
+    }
+
+    MICROSTRAIN_LOG_INFO("Filter reset.\n");
+
+    // initialize euler angles
+
+    static mip_dispatch_handler init_data_handler[1];
+
+    // Data stores for filter data
+
+    static mip_filter_euler_angles_data filter_euler_angles = {0};
+
+    // Register the callbacks for the filter fields
+
+    mip_interface_register_extractor(
+        _device,
+        &init_data_handler[0],
+        MIP_FILTER_DATA_DESC_SET,                        // Data descriptor set
+        MIP_DATA_DESC_FILTER_ATT_EULER_ANGLES,           // Data field descriptor set
+        extract_mip_filter_euler_angles_data_from_field, // Callback
+        &filter_euler_angles                             // Data field out
+        );
+
+    // 3. Pollear un mensaje del filtro con el campo de euler
+    //    0 = la decimación se ignora en poll; el array es de mip_descriptor_rate
+    const mip_descriptor_rate attitude_descriptors[1] = {
+        {MIP_DATA_DESC_FILTER_ATT_EULER_ANGLES, 0}, // Euler, orientación estimada
+    };
+
+    // Llamar a la función de poll
+    const mip_cmd_result poll_result = mip_3dm_poll_filter_message(
+        _device,
+        false,               // suppress_ack = false, sí quiero el ACK/NACK
+        1,                   // num_descriptors = 1
+        attitude_descriptors // el array con el campo que quiero
+    );
+
+    if (!mip_cmd_result_is_ack(poll_result))
+    {
+        exit_from_command(_device, poll_result, "Failed to poll attitude.\n");
+    }
+
+    // 4. Bombear la interfaz para RECIBIR el paquete de datos polleado.
+    //    El ACK ya llegó; ahora hay que leer el paquete 0x82 que viene aparte.
+    //    Reintentar un poco por si el dato tarda uno o dos ciclos.
+    for (int i = 0; i < 10 && filter_euler_angles.valid_flags == 0; ++i)
+    {
+        mip_interface_update(_device, 20, false); // 20 ms por intento
+    }
+
+    if (filter_euler_angles.valid_flags != 0)
+    {
+        MICROSTRAIN_LOG_INFO(
+            "Polled attitude: roll=%.4f pitch=%.4f yaw=%.4f (flags=0x%04X)\n",
+            filter_euler_angles.roll, filter_euler_angles.pitch, filter_euler_angles.yaw, filter_euler_angles.valid_flags);
+    }
+    else
+    {
+        MICROSTRAIN_LOG_WARN("Poll: no valid attitude yet after reset.\n");
+    }
+    // El paquete de datos llegará por separado, como un paquete normal
+    // del Filter data set (0x82), que tu callback/parser de recepción
+    // procesará igual que si viniera de streaming continuo.
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 /// @brief Gets the current system timestamp in milliseconds
 ///
@@ -616,7 +707,7 @@ static void initialize_device(mip_interface *_device, serial_port *_device_port,
     // duration of the command and restore it afterward (same technique as capture_gyro_bias).
     mip_cmd_queue *cmd_queue = mip_interface_cmd_queue(_device);
     const mip_timeout previous_timeout = mip_cmd_queue_base_reply_timeout(cmd_queue);
-    
+
     MICROSTRAIN_LOG_INFO("Initial command reply timeout is %dms (raising reply timeout to 5000ms).\n", previous_timeout);
     mip_cmd_queue_set_base_reply_timeout(cmd_queue, 5000);
 
@@ -626,17 +717,13 @@ static void initialize_device(mip_interface *_device, serial_port *_device_port,
     // 1. ¿El comando se ejecutó correctamente?
     if (!mip_cmd_result_is_ack(cmd_result))
     {
-        MICROSTRAIN_LOG_ERROR(
-            "El comando BIT falló: (%d) %s\n",
-            cmd_result, mip_cmd_result_to_string(cmd_result));
-        // manejar el error (p. ej. exit_from_command en el ejemplo threading)
+        exit_from_command(_device, cmd_result, "BIT command failed!\n");
     }
-    
-    // 2. El comando respondió ACK -> revisar el resultado del test
+
     if (bit_result != 0)
     {
-        // Algún autodiagnóstico falló; los bits se decodifican con el manual del equipo
-        MICROSTRAIN_LOG_WARN("BIT reportó fallos: 0x%08" PRIX32 "\n", bit_result);
+        MICROSTRAIN_LOG_WARN("BIT reported faults: 0x%08" PRIX32 "\n", bit_result);
+        // manejar el error (p. ej. exit_from_command en el ejemplo threading)
     }
     else
     {
