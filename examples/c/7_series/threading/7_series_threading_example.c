@@ -39,6 +39,11 @@
 #include <mip/definitions/data_sensor.h>
 #include <mip/definitions/data_shared.h>
 
+#ifdef _MSC_VER
+#define _USE_MATH_DEFINES
+#endif // _MSC_VER
+
+#include <math.h>
 #include <assert.h>
 #include <inttypes.h>
 #include <signal.h>
@@ -290,23 +295,27 @@ int main(const int argc, const char *argv[])
     MICROSTRAIN_LOG_INFO("This example will now output data for %ds.\n", RUN_TIME_SECONDS);
 
     // Get the start time of the device update loop to handle exiting the application
-    const mip_timestamp loop_start_time = get_current_timestamp();
+    // const mip_timestamp loop_start_time = get_current_timestamp();
 
     // Main loop — exits on SIGTERM/SIGINT or after RUN_TIME_SECONDS
-    // while (!g_stop_requested)
-    while (get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
+    while (!g_stop_requested)
+    // while (!g_stop_requested && get_current_timestamp() - loop_start_time <= RUN_TIME_SECONDS * 1000)
     {
         // Stress testing the device with ping
         // This attempts to trigger race conditions across threads
         // Note: Only one thread at a time can safely send commands
-        MICROSTRAIN_LOG_WARN("Running device stress test!\n");
-        for (uint8_t counter = 0; counter < 100; ++counter)
-        {
-            // Note: Sending commands calls the device update function every time
-            mip_base_ping(&device);
-        }
+        // MICROSTRAIN_LOG_WARN("Running device stress test!\n");
+        // for (uint8_t counter = 0; counter < 100; ++counter)
+        // {
+        //     // Note: Sending commands calls the device update function every time
+        //     mip_base_ping(&device);
+        // }
+        // Poner función de corrección de heading y demás eventos
 #if USE_THREADS
-        // Data collection thread drives all device reads; main thread just idles
+        // The data collection thread drives all device reads; the main thread just idles.
+        // Note: This is the place to send commands in a future version (e.g. true-heading
+        // updates with external corrections). The command/data split in update_device keeps
+        // command traffic issued from this thread safe against the data thread's reads.
         const struct timespec ts_idle = {.tv_sec = 0, .tv_nsec = 100 * 1000000}; // 100 ms
         nanosleep(&ts_idle, NULL);
 #else
@@ -482,73 +491,22 @@ static void capture_gyro_bias(mip_interface *_device)
 static void initialize_estimation_filter(mip_interface *_device)
 {
     mip_cmd_result cmd_result = mip_filter_reset(_device);
-
     if (!mip_cmd_result_is_ack(cmd_result))
     {
         exit_from_command(_device, cmd_result, "Failed to reset filter.\n");
     }
-
     MICROSTRAIN_LOG_INFO("Filter reset.\n");
 
-    // initialize euler angles
-
-    static mip_dispatch_handler init_data_handler[1];
-
-    // Data stores for filter data
-
-    static mip_filter_euler_angles_data filter_euler_angles = {0};
-
-    // Register the callbacks for the filter fields
-
-    mip_interface_register_extractor(
-        _device,
-        &init_data_handler[0],
-        MIP_FILTER_DATA_DESC_SET,                        // Data descriptor set
-        MIP_DATA_DESC_FILTER_ATT_EULER_ANGLES,           // Data field descriptor set
-        extract_mip_filter_euler_angles_data_from_field, // Callback
-        &filter_euler_angles                             // Data field out
-        );
-
-    // 3. Pollear un mensaje del filtro con el campo de euler
-    //    0 = la decimación se ignora en poll; el array es de mip_descriptor_rate
-    const mip_descriptor_rate attitude_descriptors[1] = {
-        {MIP_DATA_DESC_FILTER_ATT_EULER_ANGLES, 0}, // Euler, orientación estimada
-    };
-
-    // Llamar a la función de poll
-    const mip_cmd_result poll_result = mip_3dm_poll_filter_message(
-        _device,
-        false,               // suppress_ack = false, sí quiero el ACK/NACK
-        1,                   // num_descriptors = 1
-        attitude_descriptors // el array con el campo que quiero
-    );
-
-    if (!mip_cmd_result_is_ack(poll_result))
+    // Nota: heading en RADIANES [-pi, pi]. Ignorado si el aiding de magnetómetro está habilitado.
+    const float initial_heading_deg = 0.0f;
+    const float initial_heading_rad = initial_heading_deg * M_PI / 180.0;
+    cmd_result = mip_filter_set_initial_heading(_device, initial_heading_rad);
+    
+    if (!mip_cmd_result_is_ack(cmd_result))
     {
-        exit_from_command(_device, poll_result, "Failed to poll attitude.\n");
+        exit_from_command(_device, cmd_result, "Failed to initialize heading.\n");
     }
-
-    // 4. Bombear la interfaz para RECIBIR el paquete de datos polleado.
-    //    El ACK ya llegó; ahora hay que leer el paquete 0x82 que viene aparte.
-    //    Reintentar un poco por si el dato tarda uno o dos ciclos.
-    for (int i = 0; i < 10 && filter_euler_angles.valid_flags == 0; ++i)
-    {
-        mip_interface_update(_device, 20, false); // 20 ms por intento
-    }
-
-    if (filter_euler_angles.valid_flags != 0)
-    {
-        MICROSTRAIN_LOG_INFO(
-            "Polled attitude: roll=%.4f pitch=%.4f yaw=%.4f (flags=0x%04X)\n",
-            filter_euler_angles.roll, filter_euler_angles.pitch, filter_euler_angles.yaw, filter_euler_angles.valid_flags);
-    }
-    else
-    {
-        MICROSTRAIN_LOG_WARN("Poll: no valid attitude yet after reset.\n");
-    }
-    // El paquete de datos llegará por separado, como un paquete normal
-    // del Filter data set (0x82), que tu callback/parser de recepción
-    // procesará igual que si viniera de streaming continuo.
+    MICROSTRAIN_LOG_INFO("Setted the initial heading.\n");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
